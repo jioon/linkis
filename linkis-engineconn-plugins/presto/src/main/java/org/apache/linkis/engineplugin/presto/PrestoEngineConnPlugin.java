@@ -25,26 +25,38 @@ import org.apache.linkis.manager.engineplugin.common.launch.EngineConnLaunchBuil
 import org.apache.linkis.manager.engineplugin.common.resource.EngineResourceFactory;
 import org.apache.linkis.manager.engineplugin.common.resource.GenericEngineResourceFactory;
 import org.apache.linkis.manager.label.entity.Label;
+import org.apache.linkis.manager.label.entity.engine.EngineType;
+import org.apache.linkis.manager.label.utils.EngineTypeLabelCreator;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 public class PrestoEngineConnPlugin implements EngineConnPlugin {
-  private Object resourceLocker = new Object();
-  private Object engineFactoryLocker = new Object();
+  private final Object resourceLocker = new Object();
+  private final Object locker = new Object();
+
   private volatile EngineResourceFactory engineResourceFactory;
   private volatile EngineConnFactory engineFactory;
-  private List<Label<?>> defaultLabels = new ArrayList<>();
+  private final List<Label<?>> defaultLabels = new ArrayList<>();
+
+  private final EngineConnLaunchBuilder launchBuilder = new PrestoProcessEngineConnLaunchBuilder();
 
   @Override
-  public void init(Map<String, Object> params) {}
+  public void init(Map<String, Object> params) {
+    // Keep consistent with other EngineConn plugins: provide a default EngineTypeLabel
+    // so Manager/Entrance can correctly recognize engine type and version.
+    this.defaultLabels.clear();
+    this.defaultLabels.add(EngineTypeLabelCreator.createEngineTypeLabel(EngineType.PRESTO().toString()));
+  }
 
   @Override
   public EngineResourceFactory getEngineResourceFactory() {
     if (null == engineResourceFactory) {
       synchronized (resourceLocker) {
-        engineResourceFactory = new GenericEngineResourceFactory();
+        if (null == engineResourceFactory) {
+          engineResourceFactory = new GenericEngineResourceFactory();
+        }
       }
     }
     return engineResourceFactory;
@@ -52,14 +64,16 @@ public class PrestoEngineConnPlugin implements EngineConnPlugin {
 
   @Override
   public EngineConnLaunchBuilder getEngineConnLaunchBuilder() {
-    return new PrestoProcessEngineConnLaunchBuilder();
+    return launchBuilder;
   }
 
   @Override
   public EngineConnFactory getEngineConnFactory() {
     if (null == engineFactory) {
-      synchronized (engineFactoryLocker) {
-        engineFactory = new PrestoEngineConnFactory();
+      synchronized (locker) {
+        if (null == engineFactory) {
+          engineFactory = new PrestoEngineConnFactory();
+        }
       }
     }
     return engineFactory;
