@@ -34,7 +34,7 @@ import java.util.Map;
 
 public class PrestoEngineConnPlugin implements EngineConnPlugin {
   private final Object resourceLocker = new Object();
-  private final Object engineFactoryLocker = new Object();
+  private final Object locker = new Object();
 
   private volatile EngineResourceFactory engineResourceFactory;
   private volatile EngineConnFactory engineFactory;
@@ -70,7 +70,7 @@ public class PrestoEngineConnPlugin implements EngineConnPlugin {
   @Override
   public EngineConnFactory getEngineConnFactory() {
     if (null == engineFactory) {
-      synchronized (engineFactoryLocker) {
+      synchronized (locker) {
         if (null == engineFactory) {
           engineFactory = new PrestoEngineConnFactory();
         }
