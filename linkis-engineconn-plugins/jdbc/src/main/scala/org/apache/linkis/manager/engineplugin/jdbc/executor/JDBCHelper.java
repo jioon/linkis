@@ -122,7 +122,8 @@ public class JDBCHelper {
                 retVal = IntType.typeName();
                 break;
             case Types.LONGNVARCHAR:
-                retVal = LongType.typeName();
+                // LONGNVARCHAR represents long-length string data, not numeric BIGINT.
+                retVal = StringType.typeName();
                 break;
             case Types.LONGVARCHAR:
                 retVal = StringType.typeName();

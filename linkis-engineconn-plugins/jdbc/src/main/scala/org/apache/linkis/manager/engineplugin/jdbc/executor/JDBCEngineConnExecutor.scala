@@ -25,7 +25,6 @@ import org.apache.linkis.engineconn.computation.executor.execute.{
   EngineExecutionContext
 }
 import org.apache.linkis.engineconn.core.EngineConnObject
-import org.apache.linkis.governance.common.paser.SQLCodeParser
 import org.apache.linkis.governance.common.protocol.conf.{
   RequestQueryEngineConfig,
   ResponseQueryConfig
@@ -71,6 +70,7 @@ import org.apache.commons.lang3.StringUtils
 
 import org.springframework.util.CollectionUtils
 
+import java.nio.charset.StandardCharsets
 import java.sql.{Connection, ResultSet, Statement}
 import java.util
 import java.util.concurrent.ConcurrentHashMap
@@ -86,11 +86,12 @@ class JDBCEngineConnExecutor(override val outputPrintLimit: Int, val id: Int)
   private val progressMonitors: util.Map[String, ProgressMonitor[_]] =
     new ConcurrentHashMap[String, ProgressMonitor[_]]()
 
-  private val connectionCache: util.Map[String, Connection] = new util.HashMap[String, Connection]()
+  private val connectionCache: util.Map[String, Connection] = new ConcurrentHashMap[String, Connection]()
 
   override def init(): Unit = {
     logger.info("jdbc executor start init.")
-    setCodeParser(new SQLCodeParser)
+    // add JDBC default limit enforcement to avoid huge result sets
+    setCodeParser(new JDBCCodeParser)
     super.init()
     if (JDBCConfiguration.JDBC_KERBEROS_ENABLE.getValue) {
       connectionManager.startRefreshKerberosLoginStatusThread()
@@ -100,9 +101,13 @@ class JDBCEngineConnExecutor(override val outputPrintLimit: Int, val id: Int)
   override def execute(engineConnTask: EngineConnTask): ExecuteResponse = {
     val executeResponse = super.execute(engineConnTask)
     if (StringUtils.isNotBlank(engineConnTask.getTaskId)) {
-      val connection = connectionCache.remove(engineConnTask.getTaskId)
+      val taskId = engineConnTask.getTaskId
+      val connection = connectionCache.remove(taskId)
       logger.info(s"remove task ${engineConnTask.getTaskId} connection")
-      Utils.tryAndWarn(connection.close())
+      if (connection != null) {
+        Utils.tryAndWarn(connection.close())
+      }
+      progressMonitors.remove(taskId)
     }
     executeResponse
   }
@@ -117,14 +122,14 @@ class JDBCEngineConnExecutor(override val outputPrintLimit: Int, val id: Int)
       return connectionCache.get(taskId)
     }
     val properties: util.Map[String, String] = getJDBCRuntimeParams(engineExecutorContext)
-    logger.info(s"The jdbc properties is: $properties")
+    logger.info(s"The jdbc properties is: ${redactJdbcProperties(properties)}")
     val dataSourceName = properties.get(JDBCEngineConnConstant.JDBC_ENGINE_RUN_TIME_DS)
     val dataSourceMaxVersionId =
       properties.get(JDBCEngineConnConstant.JDBC_ENGINE_RUN_TIME_DS_MAX_VERSION_ID)
     logger.info(
       s"The data source name is [$dataSourceName], and the jdbc client begins to run task ${taskId}"
     )
-    logger.info(s"The data source properties is $properties")
+    logger.info(s"The data source properties is ${redactJdbcProperties(properties)}")
     /* url + user as the cache key */
     val jdbcUrl: String = properties.get(JDBCEngineConnConstant.JDBC_URL)
     val execUser: String = properties.get(JDBCEngineConnConstant.JDBC_SCRIPTS_EXEC_USER)
@@ -145,7 +150,7 @@ class JDBCEngineConnExecutor(override val outputPrintLimit: Int, val id: Int)
 
   def parseJdbcUrl(jdbcUrl: String, parameters: util.Map[String, String]): Unit = {
     if (StringUtils.isEmpty(jdbcUrl)) {
-      return None
+      return
     }
     val queryIndex = jdbcUrl.indexOf('?')
     if (queryIndex != -1) {
@@ -162,7 +167,7 @@ class JDBCEngineConnExecutor(override val outputPrintLimit: Int, val id: Int)
           }
         } catch {
           case e: Exception =>
-            logger.info(s"wrong link parameters: ${pair}")
+            logger.warn(s"wrong jdbc url parameters pair: ${pair}", e)
         }
       }
     }
@@ -183,7 +188,10 @@ class JDBCEngineConnExecutor(override val outputPrintLimit: Int, val id: Int)
       if (statement.getQueryTimeout == 0) {
         statement.setQueryTimeout(JDBCConfiguration.JDBC_QUERY_TIMEOUT.getValue)
       }
-      statement.setFetchSize(outputPrintLimit)
+      val fetchSize = Math.min(JDBCConfiguration.JDBC_FETCH_SIZE.getValue, outputPrintLimit)
+      if (fetchSize > 0) {
+        statement.setFetchSize(fetchSize)
+      }
 
       val monitor = ProgressMonitor.attachMonitor(statement)
       if (monitor != null) {
@@ -368,18 +376,27 @@ class JDBCEngineConnExecutor(override val outputPrintLimit: Int, val id: Int)
       val resultSetWriter =
         engineExecutorContext.createResultSetWriter(ResultSetFactory.TABLE_TYPE)
       resultSetWriter.addMetaData(metaData)
+      var rowCount = 0
+      var truncated = false
       Utils.tryCatch({
-        while (resultSet.next()) {
+        while (resultSet.next() && !truncated) {
+          if (rowCount >= outputPrintLimit) {
+            truncated = true
+          } else {
           val r: Array[Any] = columns.indices.map { i =>
-            val data = resultSet.getObject(i + 1) match {
-              case value: Array[Byte] =>
-                new String(resultSet.getObject(i + 1).asInstanceOf[Array[Byte]])
-              case value: Any => resultSet.getString(i + 1)
-              case _ => null
+            val obj = resultSet.getObject(i + 1)
+            if (obj == null) {
+              null
+            } else {
+              obj match {
+                case bytes: Array[Byte] => new String(bytes, StandardCharsets.UTF_8)
+                case other => other.toString
+              }
             }
-            data
           }.toArray
           resultSetWriter.addRecord(new TableRecord(r.asInstanceOf[Array[Any]]))
+          rowCount += 1
+          }
         }
       }) { case e: Exception =>
         return ErrorExecuteResponse("query jdbc failed", e)
@@ -388,9 +405,29 @@ class JDBCEngineConnExecutor(override val outputPrintLimit: Int, val id: Int)
       Utils.tryQuietly {
         IOUtils.closeQuietly(resultSetWriter)
       }
+      if (truncated) {
+        engineExecutorContext.appendStdout(
+          s"Result truncated: returned $rowCount rows (max ${outputPrintLimit})."
+        )
+      }
       logger.info("sql executed completed.")
       AliasOutputExecuteResponse(null, output)
     }
+  }
+
+  private def redactJdbcProperties(props: util.Map[String, String]): util.Map[String, String] = {
+    if (props == null) return null
+    val copy = new util.HashMap[String, String](props)
+    val sensitiveKeys = Array(
+      JDBCEngineConnConstant.JDBC_PASSWORD,
+      JDBCEngineConnConstant.JDBC_KERBEROS_AUTH_TYPE_KEYTAB_LOCATION
+    )
+    sensitiveKeys.foreach { k =>
+      if (copy.containsKey(k) && StringUtils.isNotBlank(copy.get(k))) {
+        copy.put(k, "******")
+      }
+    }
+    copy
   }
 
   private def getExecSqlUser(engineExecutionContext: EngineExecutionContext): String = {
@@ -473,12 +510,27 @@ class JDBCEngineConnExecutor(override val outputPrintLimit: Int, val id: Int)
   override def killAll(): Unit = {
     logger.info("Killing all query task.")
     connectionManager.initTaskStatementMap()
+    // release cached connections (return to pool) and monitors
+    val iter = connectionCache.entrySet().iterator()
+    while (iter.hasNext) {
+      val entry = iter.next()
+      iter.remove()
+      if (entry.getValue != null) {
+        Utils.tryAndWarn(entry.getValue.close())
+      }
+    }
+    progressMonitors.clear()
     logger.info("All query task has killed successfully.")
   }
 
   override def killTask(taskId: String): Unit = {
     logger.info(s"Killing jdbc query task $taskId")
     connectionManager.cancelStatement(taskId)
+    val conn = connectionCache.remove(taskId)
+    if (conn != null) {
+      Utils.tryAndWarn(conn.close())
+    }
+    progressMonitors.remove(taskId)
     super.killTask(taskId)
     logger.info(s"The query task $taskId has killed successfully.")
   }

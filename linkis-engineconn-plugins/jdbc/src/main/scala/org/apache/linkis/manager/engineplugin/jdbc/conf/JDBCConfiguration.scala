@@ -28,6 +28,14 @@ object JDBCConfiguration {
 
   val JDBC_QUERY_TIMEOUT = CommonVars("wds.linkis.jdbc.query.timeout", 1800)
 
+  /**
+   * JDBC fetchSize for Statement/ResultSet streaming.
+   *
+   * Note: Some drivers treat fetchSize as a hint; for MySQL streaming you may also need
+   * url params like useCursorFetch=true (depending on driver/version).
+   */
+  val JDBC_FETCH_SIZE = CommonVars("wds.linkis.jdbc.fetch.size", 1000)
+
   val JDBC_CONCURRENT_LIMIT = CommonVars[Int]("wds.linkis.engineconn.jdbc.concurrent.limit", 100)
 
   val JDBC_KERBEROS_ENABLE = CommonVars[Boolean]("wds.linkis.keytab.enable", false)
