@@ -36,8 +36,9 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.text.MessageFormat;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -63,7 +64,7 @@ public class ConnectionManager {
 
   private ConnectionManager() {
     jdbcDataSourceConfigurations = new JDBCDataSourceConfigurations();
-    dataSourceFactories = new HashMap<>();
+    dataSourceFactories = new ConcurrentHashMap<>();
   }
 
   public static ConnectionManager getInstance() {
@@ -206,7 +207,16 @@ public class ConnectionManager {
       password = AESUtils.decrypt(password, AESUtils.LINKIS_DATASOURCE_AES_KEY.getValue());
     }
     datasource.setPassword(password);
-    datasource.setConnectProperties(SecurityUtils.getMysqlSecurityParams());
+    Properties connectProps = new Properties();
+    connectProps.putAll(SecurityUtils.getMysqlSecurityParams());
+    // best-effort propagate common driver timeouts (many drivers accept these keys)
+    if (connectionTimeout > 0) {
+      connectProps.setProperty("connectTimeout", String.valueOf(connectionTimeout));
+    }
+    if (socketTimeout > 0) {
+      connectProps.setProperty("socketTimeout", String.valueOf(socketTimeout));
+    }
+    datasource.setConnectProperties(connectProps);
     datasource.setDriverClassName(driverClassName);
     datasource.setInitialSize(initialSize);
     datasource.setMinIdle(minIdle);
@@ -221,6 +231,10 @@ public class ConnectionManager {
     datasource.setPoolPreparedStatements(poolPreparedStatements);
     datasource.setRemoveAbandoned(removeAbandoned);
     datasource.setRemoveAbandonedTimeout(removeAbandonedTimeout);
+    boolean logAbandoned =
+        JDBCPropertiesParser.getBool(
+            properties, JDBCEngineConnConstant.JDBC_POOL_REMOVE_ABANDONED_LOG_ENABLED, false);
+    datasource.setLogAbandoned(logAbandoned);
     if (queryTimeout > 0) {
       datasource.setQueryTimeout(queryTimeout);
     }
@@ -233,6 +247,7 @@ public class ConnectionManager {
     DataSource dataSource = dataSourceFactories.get(dataSourceIdentifier);
     if (dataSource == null) {
       synchronized (dataSourceFactories) {
+        dataSource = dataSourceFactories.get(dataSourceIdentifier);
         if (dataSource == null) {
           dataSource = buildDataSource(url, prop);
           dataSourceFactories.put(dataSourceIdentifier, dataSource);
